@@ -2,6 +2,7 @@
 package main
 
 import (
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	_, err = webarchive.NewReader(f)
+	rdr, err := webarchive.NewReader(f)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -34,6 +35,7 @@ func main() {
 	mountdir := filepath.Base(os.Args[1])
 	mountdir = strings.TrimSuffix(mountdir, filepath.Ext(mountdir))
 	mountdir = strings.TrimSuffix(mountdir, filepath.Ext(mountdir))
+	os.MkdirAll(mountdir, 0777)
 
 	c, err := fuse.Mount(
 		mountdir,
@@ -47,7 +49,7 @@ func main() {
 	}
 	defer c.Close()
 
-	err = fs.Serve(c, FS{})
+	err = fs.Serve(c, FS{Dir{f, rdr}})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,15 +61,19 @@ func main() {
 	}
 }
 
-// FS implements the hello world file system.
-type FS struct{}
+type FS struct {
+	nd fs.Node
+}
 
-func (FS) Root() (fs.Node, error) {
-	return Dir{}, nil
+func (f FS) Root() (fs.Node, error) {
+	return f.nd, nil
 }
 
 // Dir implements both Node and Handle for the root directory.
-type Dir struct{}
+type Dir struct {
+	f *os.File
+	r webarchive.Reader
+}
 
 func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 1
@@ -75,33 +81,47 @@ func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func (Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	if name == "hello" {
-		return File{}, nil
+func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	d.f.Seek(0, 0)
+	d.r.Reset(d.f)
+	var idx uint64 = 2
+	for record, err := d.r.NextPayload(); err == nil; record, err = d.r.NextPayload() {
+		if name == record.URL() {
+			return File{idx, record}, nil
+		}
+		idx++
 	}
 	return nil, fuse.ENOENT
 }
 
-var dirDirs = []fuse.Dirent{
-	{Inode: 2, Name: "hello", Type: fuse.DT_File},
+func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	d.f.Seek(0, 0)
+	d.r.Reset(d.f)
+	var idx uint64 = 2
+	dirs := make([]fuse.Dirent, 0, 100)
+	for record, err := d.r.NextPayload(); err == nil; record, err = d.r.NextPayload() {
+		dirs = append(dirs, fuse.Dirent{
+			Inode: idx,
+			Name:  record.URL(),
+			Type:  fuse.DT_File,
+		})
+		idx++
+	}
+	return dirs, nil
 }
 
-func (Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	return dirDirs, nil
+type File struct {
+	idx uint64
+	rec webarchive.Record
 }
 
-// File implements both Node and Handle for the hello file.
-type File struct{}
-
-const greeting = "hello, world\n"
-
-func (File) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 2
+func (f File) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Inode = f.idx
 	a.Mode = 0444
-	a.Size = uint64(len(greeting))
+	a.Size = uint64(f.rec.Size())
 	return nil
 }
 
-func (File) ReadAll(ctx context.Context) ([]byte, error) {
-	return []byte(greeting), nil
+func (f File) ReadAll(ctx context.Context) ([]byte, error) {
+	return ioutil.ReadAll(f.rec)
 }
