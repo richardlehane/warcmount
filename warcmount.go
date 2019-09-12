@@ -2,7 +2,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -27,7 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	rdr, err := webarchive.NewReader(f)
+	_, err = webarchive.NewReader(f)
 	if err != nil {
 		log.Fatal(err)
 	}
