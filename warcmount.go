@@ -2,9 +2,12 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -18,7 +21,6 @@ import (
 )
 
 func main() {
-
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: warcmount WARC_FILE.warc.gz")
 	}
@@ -32,10 +34,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	rt, err := newFS(rdr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	mountdir := filepath.Base(os.Args[1])
 	mountdir = strings.TrimSuffix(mountdir, filepath.Ext(mountdir))
 	mountdir = strings.TrimSuffix(mountdir, filepath.Ext(mountdir))
-	os.MkdirAll(mountdir, 0777)
+	err = os.MkdirAll(mountdir, 0777)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	c, err := fuse.Mount(
 		mountdir,
@@ -47,81 +57,98 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer c.Close()
 
-	err = fs.Serve(c, FS{Dir{f, rdr}})
-	if err != nil {
-		log.Fatal(err)
-	}
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, os.Interrupt)
+	go func() {
+		<-sc
+		fuse.Unmount(mountdir)
+	}()
 
-	// check if the mount process has an error to report
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		log.Fatal(err)
-	}
+	fmt.Printf("Mounting %s at %s, use ctrl-c to unmount\n", os.Args[1], mountdir)
+	fs.Serve(c, rt)
+	os.Remove(mountdir)
+	os.Exit(1)
 }
 
 type FS struct {
-	nd fs.Node
+	files []*File
 }
 
-func (f FS) Root() (fs.Node, error) {
-	return f.nd, nil
+func newFS(rdr webarchive.Reader) (*FS, error) {
+	repl := strings.NewReplacer("\\", "_", "/", "_")
+	files := make([]*File, 0, 100)
+	idx := 2
+	var record webarchive.Record
+	var err error
+	for record, err = rdr.NextPayload(); err == nil; record, err = rdr.NextPayload() {
+		byt, e := ioutil.ReadAll(record)
+		if e != nil {
+			return nil, e
+		}
+		files = append(files, &File{
+			idx:     uint64(idx),
+			sz:      uint64(record.Size()),
+			name:    repl.Replace(record.URL()),
+			content: byt,
+		})
+		idx++
+	}
+	if err == io.EOF {
+		err = nil
+	}
+	return &FS{files}, err
 }
 
-// Dir implements both Node and Handle for the root directory.
-type Dir struct {
-	f *os.File
-	r webarchive.Reader
+func (f *FS) Root() (fs.Node, error) {
+	return &Root{f}, nil
 }
 
-func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
+type Root struct {
+	*FS
+}
+
+func (r *Root) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 1
 	a.Mode = os.ModeDir | 0555
 	return nil
 }
 
-func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	d.f.Seek(0, 0)
-	d.r.Reset(d.f)
-	var idx uint64 = 2
-	for record, err := d.r.NextPayload(); err == nil; record, err = d.r.NextPayload() {
-		if name == record.URL() {
-			return File{idx, record}, nil
+func (r *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	for _, v := range r.files {
+		if v.name == name {
+			return v, nil
 		}
-		idx++
 	}
 	return nil, fuse.ENOENT
 }
 
-func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	d.f.Seek(0, 0)
-	d.r.Reset(d.f)
-	var idx uint64 = 2
-	dirs := make([]fuse.Dirent, 0, 100)
-	for record, err := d.r.NextPayload(); err == nil; record, err = d.r.NextPayload() {
-		dirs = append(dirs, fuse.Dirent{
-			Inode: idx,
-			Name:  record.URL(),
+func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	dirs := make([]fuse.Dirent, len(r.files))
+	for i, v := range r.files {
+		dirs[i] = fuse.Dirent{
+			Inode: v.idx,
+			Name:  v.name,
 			Type:  fuse.DT_File,
-		})
-		idx++
+		}
 	}
 	return dirs, nil
 }
 
 type File struct {
-	idx uint64
-	rec webarchive.Record
+	idx     uint64
+	sz      uint64
+	name    string
+	content []byte
 }
 
 func (f File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = f.idx
 	a.Mode = 0444
-	a.Size = uint64(f.rec.Size())
+	a.Size = f.sz
 	return nil
 }
 
 func (f File) ReadAll(ctx context.Context) ([]byte, error) {
-	return ioutil.ReadAll(f.rec)
+	return f.content, nil
 }
